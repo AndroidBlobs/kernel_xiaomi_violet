@@ -2,6 +2,7 @@
  * fs/f2fs/file.c
  *
  * Copyright (c) 2012 Samsung Electronics Co., Ltd.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *             http://www.samsung.com/
  *
  * This program is free software; you can redistribute it and/or modify
@@ -1045,12 +1046,7 @@ static int __clone_blkaddrs(struct inode *src_inode, struct inode *dst_inode,
 			if (ret)
 				return ret;
 
-			ret = get_node_info(sbi, dn.nid, &ni);
-			if (ret) {
-				f2fs_put_dnode(&dn);
-				return ret;
-			}
-
+			get_node_info(sbi, dn.nid, &ni);
 			ilen = min((pgoff_t)
 				ADDRS_PER_PAGE(dn.node_page, dst_inode) -
 						dn.ofs_in_node, len - i);
@@ -2771,7 +2767,7 @@ static int f2fs_ioc_set_pin_file(struct file *filp, unsigned long arg)
 
 	if (!pin) {
 		clear_inode_flag(inode, FI_PIN_FILE);
-		F2FS_I(inode)->i_gc_failures = 1;
+		f2fs_i_gc_failures_write(inode, 0);
 		goto done;
 	}
 

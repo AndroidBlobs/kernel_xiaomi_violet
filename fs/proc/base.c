@@ -3,6 +3,7 @@
  *  linux/fs/proc/base.c
  *
  *  Copyright (C) 1991, 1992 Linus Torvalds
+ *  Copyright (C) 2019 XiaoMi, Inc.
  *
  *  proc base directory handling functions
  *
@@ -230,10 +231,10 @@ static ssize_t get_mm_cmdline(struct mm_struct *mm, char __user *buf,
 		return 0;
 
 	/*
-	 * We have traditionally allowed the user to re-write
-	 * the argument strings and overflow the end result
-	 * into the environment section. But only do that if
-	 * the environment area is contiguous to the arguments.
+	* We have traditionally allowed the user to re-write
+	* the argument strings and overflow the end result
+	* into the environment section. But only do that if
+	* the environment area is contiguous to the arguments.
 	 */
 	if (env_start != arg_end || env_start >= env_end)
 		env_start = env_end = arg_end;
@@ -260,21 +261,21 @@ static ssize_t get_mm_cmdline(struct mm_struct *mm, char __user *buf,
 
 		got = access_remote_vm(mm, pos, page, size, FOLL_ANON);
 		if (got <= 0)
-			break;
+					   break;
 
 		/* Don't walk past a NUL character once you hit arg_end */
 		if (pos + got >= arg_end) {
 			int n = 0;
 
 			/*
-			 * If we started before 'arg_end' but ended up
-			 * at or after it, we start the NUL character
-			 * check at arg_end-1 (where we expect the normal
-			 * EOF to be).
-			 *
-			 * NOTE! This is smaller than 'got', because
-			 * pos + got >= arg_end
-			 */
+			* If we started before 'arg_end' but ended up
+			* at or after it, we start the NUL character
+			* check at arg_end-1 (where we expect the normal
+			* EOF to be).
+			*
+			* NOTE! This is smaller than 'got', because
+			* pos + got >= arg_end
+			*/
 			if (pos < arg_end)
 				n = arg_end - pos - 1;
 
@@ -283,17 +284,16 @@ static ssize_t get_mm_cmdline(struct mm_struct *mm, char __user *buf,
 			if (!got)
 				break;
 		}
-
 		got -= copy_to_user(buf, page, got);
 		if (unlikely(!got)) {
 			if (!len)
 				len = -EFAULT;
 			break;
 		}
-		pos += got;
-		buf += got;
-		len += got;
-		count -= got;
+	pos += got;
+	buf += got;
+	len += got;
+	count -= got;
 	}
 
 	free_page((unsigned long)page);
@@ -301,36 +301,36 @@ static ssize_t get_mm_cmdline(struct mm_struct *mm, char __user *buf,
 }
 
 static ssize_t get_task_cmdline(struct task_struct *tsk, char __user *buf,
-				size_t count, loff_t *pos)
+ 			  size_t count, loff_t *pos)
 {
-	struct mm_struct *mm;
-	ssize_t ret;
+   struct mm_struct *mm;
+   ssize_t ret;
 
-	mm = get_task_mm(tsk);
-	if (!mm)
-		return 0;
+   mm = get_task_mm(tsk);
+   if (!mm)
+ 	  return 0;
 
-	ret = get_mm_cmdline(mm, buf, count, pos);
-	mmput(mm);
-	return ret;
+   ret = get_mm_cmdline(mm, buf, count, pos);
+   mmput(mm);
+   return ret;
 }
 
 static ssize_t proc_pid_cmdline_read(struct file *file, char __user *buf,
-				     size_t count, loff_t *pos)
+ 				   size_t count, loff_t *pos)
 {
-	struct task_struct *tsk;
-	ssize_t ret;
+   struct task_struct *tsk;
+   ssize_t ret;
 
-	BUG_ON(*pos < 0);
+   BUG_ON(*pos < 0);
 
-	tsk = get_proc_task(file_inode(file));
-	if (!tsk)
-		return -ESRCH;
-	ret = get_task_cmdline(tsk, buf, count, pos);
-	put_task_struct(tsk);
-	if (ret > 0)
-		*pos += ret;
-	return ret;
+   tsk = get_proc_task(file_inode(file));
+   if (!tsk)
+ 	  return -ESRCH;
+   ret = get_task_cmdline(tsk, buf, count, pos);
+   put_task_struct(tsk);
+   if (ret > 0)
+ 	  *pos += ret;
+   return ret;
 }
 
 static const struct file_operations proc_pid_cmdline_ops = {

@@ -368,10 +368,8 @@ int ovl_verify_origin(struct dentry *dentry, struct vfsmount *mnt,
 
 	fh = ovl_encode_fh(origin, is_upper);
 	err = PTR_ERR(fh);
-	if (IS_ERR(fh)) {
-		fh = NULL;
+	if (IS_ERR(fh))
 		goto fail;
-	}
 
 	err = ovl_verify_origin_fh(dentry, fh);
 	if (set && err == -ENODATA)
