@@ -1,4 +1,5 @@
-/* Copyright (c) 2017-2019 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2017-2018 The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -56,9 +57,7 @@ struct step_chg_info {
 	bool			sw_jeita_cfg_valid;
 	bool			soc_based_step_chg;
 	bool			ocv_based_step_chg;
-	bool			vbat_avg_based_step_chg;
 	bool			batt_missing;
-	bool			taper_fcc;
 	int			jeita_fcc_index;
 	int			jeita_fv_index;
 	int			step_index;
@@ -75,10 +74,11 @@ struct step_chg_info {
 	struct power_supply	*batt_psy;
 	struct power_supply	*bms_psy;
 	struct power_supply	*usb_psy;
-	struct power_supply	*dc_psy;
+	struct power_supply	*main_psy;
 	struct delayed_work	status_change_work;
 	struct delayed_work	get_config_work;
 	struct notifier_block	nb;
+	int last_vol;
 };
 
 static struct step_chg_info *the_chip;
@@ -121,39 +121,6 @@ static bool is_usb_available(struct step_chg_info *chip)
 		return false;
 
 	return true;
-}
-
-static bool is_input_present(struct step_chg_info *chip)
-{
-	int rc = 0, input_present = 0;
-	union power_supply_propval pval = {0, };
-
-	if (!chip->usb_psy)
-		chip->usb_psy = power_supply_get_by_name("usb");
-	if (chip->usb_psy) {
-		rc = power_supply_get_property(chip->usb_psy,
-				POWER_SUPPLY_PROP_PRESENT, &pval);
-		if (rc < 0)
-			pr_err("Couldn't read USB Present status, rc=%d\n", rc);
-		else
-			input_present |= pval.intval;
-	}
-
-	if (!chip->dc_psy)
-		chip->dc_psy = power_supply_get_by_name("dc");
-	if (chip->dc_psy) {
-		rc = power_supply_get_property(chip->dc_psy,
-				POWER_SUPPLY_PROP_PRESENT, &pval);
-		if (rc < 0)
-			pr_err("Couldn't read DC Present status, rc=%d\n", rc);
-		else
-			input_present |= pval.intval;
-	}
-
-	if (input_present)
-		return true;
-
-	return false;
 }
 
 int read_range_data_from_node(struct device_node *node,
@@ -295,8 +262,6 @@ static int get_step_chg_jeita_setting_from_profile(struct step_chg_info *chip)
 		return rc;
 	}
 
-	chip->taper_fcc = of_property_read_bool(profile_node, "qcom,taper-fcc");
-
 	chip->soc_based_step_chg =
 		of_property_read_bool(profile_node, "qcom,soc-based-step-chg");
 	if (chip->soc_based_step_chg) {
@@ -313,17 +278,6 @@ static int get_step_chg_jeita_setting_from_profile(struct step_chg_info *chip)
 				POWER_SUPPLY_PROP_VOLTAGE_OCV;
 		chip->step_chg_config->param.prop_name = "OCV";
 		chip->step_chg_config->param.hysteresis = 10000;
-		chip->step_chg_config->param.use_bms = true;
-	}
-
-	chip->vbat_avg_based_step_chg =
-				of_property_read_bool(profile_node,
-				"qcom,vbat-avg-based-step-chg");
-	if (chip->vbat_avg_based_step_chg) {
-		chip->step_chg_config->param.psy_prop =
-				POWER_SUPPLY_PROP_VOLTAGE_AVG;
-		chip->step_chg_config->param.prop_name = "VBAT_AVG";
-		chip->step_chg_config->param.hysteresis = 0;
 		chip->step_chg_config->param.use_bms = true;
 	}
 
@@ -417,6 +371,14 @@ static int get_val(struct range_data *range, int hysteresis, int current_index,
 
 	*new_index = -EINVAL;
 
+			/*
+		 * As battery temperature may be below 0, range.xxx is a unsigned int, but battery
+		 * temperature is a signed int, so cannot compare them when battery temp is below 0,
+		 * we treat it as 0 degree when the parameter threshold(battery temp) is below 0.
+		 */
+	if (threshold <= 0)
+			threshold = 0;
+
 	/*
 	 * If the threshold is lesser than the minimum allowed range,
 	 * return -ENODATA.
@@ -490,59 +452,15 @@ static int get_val(struct range_data *range, int hysteresis, int current_index,
 	return 0;
 }
 
-#define TAPERED_STEP_CHG_FCC_REDUCTION_STEP_MA		50000 /* 50 mA */
-static void taper_fcc_step_chg(struct step_chg_info *chip, int index,
-					int current_voltage)
-{
-	u32 current_fcc, target_fcc;
-
-	if (index < 0) {
-		pr_err("Invalid STEP CHG index\n");
-		return;
-	}
-
-	current_fcc = get_effective_result(chip->fcc_votable);
-	target_fcc = chip->step_chg_config->fcc_cfg[index].value;
-
-	if (index == 0) {
-		vote(chip->fcc_votable, STEP_CHG_VOTER, true, target_fcc);
-	} else if (current_voltage >
-		(chip->step_chg_config->fcc_cfg[index - 1].high_threshold +
-		chip->step_chg_config->param.hysteresis)) {
-		/*
-		 * Ramp down FCC in pre-configured steps till the current index
-		 * FCC configuration is reached, whenever the step charging
-		 * control parameter exceeds the high threshold of previous
-		 * step charging index configuration.
-		 */
-		vote(chip->fcc_votable, STEP_CHG_VOTER, true, max(target_fcc,
-			current_fcc - TAPERED_STEP_CHG_FCC_REDUCTION_STEP_MA));
-	} else if ((current_fcc >
-		chip->step_chg_config->fcc_cfg[index - 1].value) &&
-		(current_voltage >
-		chip->step_chg_config->fcc_cfg[index - 1].low_threshold +
-		chip->step_chg_config->param.hysteresis)) {
-		/*
-		 * In case the step charging index switch to the next higher
-		 * index without FCCs saturation for the previous index, ramp
-		 * down FCC till previous index FCC configuration is reached.
-		 */
-		vote(chip->fcc_votable, STEP_CHG_VOTER, true,
-			max(chip->step_chg_config->fcc_cfg[index - 1].value,
-			current_fcc - TAPERED_STEP_CHG_FCC_REDUCTION_STEP_MA));
-	}
-}
-
 static int handle_step_chg_config(struct step_chg_info *chip)
 {
 	union power_supply_propval pval = {0, };
-	int rc = 0, fcc_ua = 0, current_index;
+	int rc = 0, fcc_ua = 0;
 	u64 elapsed_us;
 
 	elapsed_us = ktime_us_delta(ktime_get(), chip->step_last_update_time);
-	/* skip processing, event too early */
 	if (elapsed_us < STEP_CHG_HYSTERISIS_DELAY_US)
-		return 0;
+		goto reschedule;
 
 	rc = power_supply_get_property(chip->batt_psy,
 		POWER_SUPPLY_PROP_STEP_CHARGING_ENABLED, &pval);
@@ -570,7 +488,6 @@ static int handle_step_chg_config(struct step_chg_info *chip)
 		return rc;
 	}
 
-	current_index = chip->step_index;
 	rc = get_val(chip->step_chg_config->fcc_cfg,
 			chip->step_chg_config->param.hysteresis,
 			chip->step_index,
@@ -584,37 +501,29 @@ static int handle_step_chg_config(struct step_chg_info *chip)
 		goto update_time;
 	}
 
-	/* Do not drop step-chg index, if input supply is present */
-	if (is_input_present(chip)) {
-		if (chip->step_index < current_index)
-			chip->step_index = current_index;
-	} else {
-		chip->step_index = 0;
-	}
-
 	if (!chip->fcc_votable)
 		chip->fcc_votable = find_votable("FCC");
 	if (!chip->fcc_votable)
 		return -EINVAL;
 
-	if (chip->taper_fcc) {
-		taper_fcc_step_chg(chip, chip->step_index, pval.intval);
-	} else {
-		fcc_ua = chip->step_chg_config->fcc_cfg[chip->step_index].value;
-		vote(chip->fcc_votable, STEP_CHG_VOTER, true, fcc_ua);
-	}
+	vote(chip->fcc_votable, STEP_CHG_VOTER, true, fcc_ua);
 
-	pr_debug("%s = %d Step-FCC = %duA taper-fcc: %d\n",
-		chip->step_chg_config->param.prop_name, pval.intval,
-		get_client_vote(chip->fcc_votable, STEP_CHG_VOTER),
-		chip->taper_fcc);
+	pr_info("%s = %d Step-FCC = %duA\n",
+		chip->step_chg_config->param.prop_name, pval.intval, fcc_ua);
 
 update_time:
 	chip->step_last_update_time = ktime_get();
 	return 0;
+
+reschedule:
+	/* reschedule 1000uS after the remaining time */
+	return (STEP_CHG_HYSTERISIS_DELAY_US - elapsed_us + 1000);
 }
 
 #define JEITA_SUSPEND_HYST_UV		50000
+#define JEITA_WARM_VOL		4100000
+#define JEITA_GOOD_VOL		4400000
+
 static int handle_jeita(struct step_chg_info *chip)
 {
 	union power_supply_propval pval = {0, };
@@ -639,9 +548,8 @@ static int handle_jeita(struct step_chg_info *chip)
 	}
 
 	elapsed_us = ktime_us_delta(ktime_get(), chip->jeita_last_update_time);
-	/* skip processing, event too early */
 	if (elapsed_us < STEP_CHG_HYSTERISIS_DELAY_US)
-		return 0;
+		goto reschedule;
 
 	if (chip->jeita_fcc_config->param.use_bms)
 		rc = power_supply_get_property(chip->bms_psy,
@@ -715,14 +623,29 @@ static int handle_jeita(struct step_chg_info *chip)
 		else if (pval.intval < (fv_uv - JEITA_SUSPEND_HYST_UV))
 			vote(chip->usb_icl_votable, JEITA_VOTER, false, 0);
 	}
-
 set_jeita_fv:
+	pr_info(" jeita vote fv_uv:%d last_vol:%d",fv_uv,chip->last_vol);
 	vote(chip->fv_votable, JEITA_VOTER, fv_uv ? true : false, fv_uv);
-
+	if(fv_uv == JEITA_GOOD_VOL &&chip->last_vol == JEITA_WARM_VOL) {
+		rc = power_supply_set_property(chip->batt_psy,
+				POWER_SUPPLY_PROP_FORCE_RECHARGE, &pval);
+		if(rc < 0)
+			pr_err("Can't force recharge from batt warm to good ,rc=%d\n", rc);
+	}
+chip->last_vol = fv_uv;
 update_time:
 	chip->jeita_last_update_time = ktime_get();
 
+	if (!chip->main_psy)
+		chip->main_psy = power_supply_get_by_name("main");
+	if (chip->main_psy)
+		power_supply_changed(chip->main_psy);
+
 	return 0;
+
+reschedule:
+	/* reschedule 1000uS after the remaining time */
+	return (STEP_CHG_HYSTERISIS_DELAY_US - elapsed_us + 1000);
 }
 
 static int handle_battery_insertion(struct step_chg_info *chip)
@@ -763,6 +686,9 @@ static void status_change_work(struct work_struct *work)
 	struct step_chg_info *chip = container_of(work,
 			struct step_chg_info, status_change_work.work);
 	int rc = 0;
+	int reschedule_us;
+	int reschedule_jeita_work_us = 0;
+	int reschedule_step_work_us = 0;
 	union power_supply_propval prop = {0, };
 
 	if (!is_batt_available(chip) || !is_bms_available(chip))
@@ -772,10 +698,14 @@ static void status_change_work(struct work_struct *work)
 
 	/* skip elapsed_us debounce for handling battery temperature */
 	rc = handle_jeita(chip);
-	if (rc < 0)
+	if (rc > 0)
+		reschedule_jeita_work_us = rc;
+	else if (rc < 0)
 		pr_err("Couldn't handle sw jeita rc = %d\n", rc);
 
 	rc = handle_step_chg_config(chip);
+	if (rc > 0)
+		reschedule_step_work_us = rc;
 	if (rc < 0)
 		pr_err("Couldn't handle step rc = %d\n", rc);
 
@@ -790,6 +720,14 @@ static void status_change_work(struct work_struct *work)
 						false, 0);
 		}
 	}
+
+	reschedule_us = min(reschedule_jeita_work_us, reschedule_step_work_us);
+	if (reschedule_us == 0)
+		goto exit_work;
+	else
+		schedule_delayed_work(&chip->status_change_work,
+				usecs_to_jiffies(reschedule_us));
+	return;
 
 exit_work:
 	__pm_relax(chip->step_chg_ws);

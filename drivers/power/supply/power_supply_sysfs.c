@@ -160,6 +160,9 @@ static ssize_t power_supply_show_property(struct device *dev,
 
 	if (off == POWER_SUPPLY_PROP_CHARGE_COUNTER_EXT)
 		return sprintf(buf, "%lld\n", value.int64val);
+	else if (off == POWER_SUPPLY_PROP_TYPE_RECHECK)
+		return scnprintf(buf, PAGE_SIZE, "0x%x\n",
+						value.intval);
 	else
 		return sprintf(buf, "%d\n", value.intval);
 }
@@ -386,16 +389,9 @@ static struct device_attribute power_supply_attrs[] = {
 	POWER_SUPPLY_ATTR(force_recharge),
 	POWER_SUPPLY_ATTR(fcc_stepper_enable),
 	POWER_SUPPLY_ATTR(toggle_stat),
+	POWER_SUPPLY_ATTR(type_recheck),
 	POWER_SUPPLY_ATTR(main_fcc_max),
 	POWER_SUPPLY_ATTR(fg_reset),
-	POWER_SUPPLY_ATTR(cc_soc),
-	POWER_SUPPLY_ATTR(voltage_vph),
-	POWER_SUPPLY_ATTR(batt_age_level),
-	POWER_SUPPLY_ATTR(chip_version),
-	POWER_SUPPLY_ATTR(qc_opti_disable),
-	POWER_SUPPLY_ATTR(therm_icl_limit),
-	POWER_SUPPLY_ATTR(voltage_max_limit),
-	POWER_SUPPLY_ATTR(dc_reset),
 	/* Charge pump properties */
 	POWER_SUPPLY_ATTR(cp_status1),
 	POWER_SUPPLY_ATTR(cp_status2),
