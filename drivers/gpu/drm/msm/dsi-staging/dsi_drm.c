@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -16,6 +17,8 @@
 #define pr_fmt(fmt)	"dsi-drm:[%s] " fmt, __func__
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic.h>
+#include <drm/drm_bridge.h>
+#include <linux/pm_wakeup.h>
 
 #include "msm_kms.h"
 #include "sde_connector.h"
@@ -36,6 +39,14 @@ static struct dsi_display_mode_priv_info default_priv_info = {
 	.panel_prefill_lines = DEFAULT_PANEL_PREFILL_LINES,
 	.dsc_enabled = false,
 };
+
+#define WAIT_RESUME_TIMEOUT 200
+
+struct dsi_bridge *gbridge;
+static struct delayed_work prim_panel_work;
+static atomic_t prim_panel_is_on;
+extern int fp_dsi_enable;
+static struct wakeup_source prim_panel_wakelock;
 
 static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
 				struct dsi_display_mode *dsi_mode)
@@ -80,8 +91,6 @@ static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
 		dsi_mode->dsi_mode_flags |= DSI_MODE_FLAG_DMS;
 	if (msm_is_mode_seamless_vrr(drm_mode))
 		dsi_mode->dsi_mode_flags |= DSI_MODE_FLAG_VRR;
-	if (msm_is_mode_seamless_dyn_clk(drm_mode))
-		dsi_mode->dsi_mode_flags |= DSI_MODE_FLAG_DYN_CLK;
 
 	dsi_mode->timing.h_sync_polarity =
 			!!(drm_mode->flags & DRM_MODE_FLAG_PHSYNC);
@@ -124,18 +133,13 @@ void dsi_convert_to_drm_mode(const struct dsi_display_mode *dsi_mode,
 		drm_mode->private_flags |= MSM_MODE_FLAG_SEAMLESS_DMS;
 	if (dsi_mode->dsi_mode_flags & DSI_MODE_FLAG_VRR)
 		drm_mode->private_flags |= MSM_MODE_FLAG_SEAMLESS_VRR;
-	if (dsi_mode->dsi_mode_flags & DSI_MODE_FLAG_DYN_CLK)
-		drm_mode->private_flags |= MSM_MODE_FLAG_SEAMLESS_DYN_CLK;
 
 	if (dsi_mode->timing.h_sync_polarity)
 		drm_mode->flags |= DRM_MODE_FLAG_PHSYNC;
 	if (dsi_mode->timing.v_sync_polarity)
 		drm_mode->flags |= DRM_MODE_FLAG_PVSYNC;
 
-	/* set mode name */
-	snprintf(drm_mode->name, DRM_DISPLAY_MODE_LEN, "%dx%dx%dx%d",
-			drm_mode->hdisplay, drm_mode->vdisplay,
-			drm_mode->vrefresh, drm_mode->clock);
+	drm_mode_set_name(drm_mode);
 }
 
 static int dsi_bridge_attach(struct drm_bridge *bridge)
@@ -170,6 +174,12 @@ static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 
 	atomic_set(&c_bridge->display->panel->esd_recovery_pending, 0);
 
+	if (c_bridge->display->is_prim_display && atomic_read(&prim_panel_is_on)) {
+		cancel_delayed_work_sync(&prim_panel_work);
+		__pm_relax(&prim_panel_wakelock);
+		return;
+	}
+
 	/* By this point mode should have been validated through mode_fixup */
 	rc = dsi_display_set_mode(c_bridge->display,
 			&(c_bridge->dsi_mode), 0x0);
@@ -180,8 +190,7 @@ static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 	}
 
 	if (c_bridge->dsi_mode.dsi_mode_flags &
-		(DSI_MODE_FLAG_SEAMLESS | DSI_MODE_FLAG_VRR |
-		 DSI_MODE_FLAG_DYN_CLK)) {
+		(DSI_MODE_FLAG_SEAMLESS | DSI_MODE_FLAG_VRR)) {
 		pr_debug("[%d] seamless pre-enable\n", c_bridge->id);
 		return;
 	}
@@ -209,7 +218,52 @@ static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 	if (rc)
 		pr_err("Continuous splash pipeline cleanup failed, rc=%d\n",
 									rc);
+	if (c_bridge->display->is_prim_display)
+		atomic_set(&prim_panel_is_on, true);
 }
+
+/**
+ *  dsi_bridge_interface_enable - Panel light on interface for fingerprint
+ *  In order to improve panel light on performance when unlock device by
+ *  fingerprint, export this interface for fingerprint.Once finger touch
+ *  happened, it could light on LCD panel in advance of android resume.
+ *
+ *  @timeout: DSI bridge wait time for android resume and set panel on.
+ *            If timeout, dsi bridge will disable panel to avoid fingerprint
+ *            touch by mistake.
+ */
+
+int dsi_bridge_interface_enable(int timeout)
+{
+	int ret = 0;
+	pr_info("dsi_bridge_interface_enable start\n");
+	ret = wait_event_timeout(resume_wait_q,
+		!atomic_read(&resume_pending),
+		msecs_to_jiffies(WAIT_RESUME_TIMEOUT));
+	if (!ret) {
+		pr_info("Primary fb resume timeout\n");
+		return -ETIMEDOUT;
+	}
+
+	mutex_lock(&gbridge->base.lock);
+
+	if (atomic_read(&prim_panel_is_on)) {
+		mutex_unlock(&gbridge->base.lock);
+		return 0;
+	}
+
+	__pm_stay_awake(&prim_panel_wakelock);
+	dsi_bridge_pre_enable(&gbridge->base);
+
+	if (timeout > 0)
+		schedule_delayed_work(&prim_panel_work, msecs_to_jiffies(timeout));
+	else
+		__pm_relax(&prim_panel_wakelock);
+
+	mutex_unlock(&gbridge->base.lock);
+	return ret;
+}
+EXPORT_SYMBOL(dsi_bridge_interface_enable);
 
 static void dsi_bridge_enable(struct drm_bridge *bridge)
 {
@@ -223,8 +277,7 @@ static void dsi_bridge_enable(struct drm_bridge *bridge)
 	}
 
 	if (c_bridge->dsi_mode.dsi_mode_flags &
-			(DSI_MODE_FLAG_SEAMLESS | DSI_MODE_FLAG_VRR |
-			 DSI_MODE_FLAG_DYN_CLK)) {
+			(DSI_MODE_FLAG_SEAMLESS | DSI_MODE_FLAG_VRR)) {
 		pr_debug("[%d] seamless enable\n", c_bridge->id);
 		return;
 	}
@@ -290,6 +343,21 @@ static void dsi_bridge_post_disable(struct drm_bridge *bridge)
 		return;
 	}
 	SDE_ATRACE_END("dsi_bridge_post_disable");
+
+	if (c_bridge->display->is_prim_display)
+		atomic_set(&prim_panel_is_on, false);
+}
+
+static void prim_panel_off_delayed_work(struct work_struct *work)
+{
+	mutex_lock(&gbridge->base.lock);
+	if (atomic_read(&prim_panel_is_on)&&fp_dsi_enable==1) {
+		dsi_bridge_post_disable(&gbridge->base);
+		__pm_relax(&prim_panel_wakelock);
+		mutex_unlock(&gbridge->base.lock);
+		return;
+	}
+	mutex_unlock(&gbridge->base.lock);
 }
 
 static void dsi_bridge_mode_set(struct drm_bridge *bridge,
@@ -305,12 +373,6 @@ static void dsi_bridge_mode_set(struct drm_bridge *bridge,
 
 	memset(&(c_bridge->dsi_mode), 0x0, sizeof(struct dsi_display_mode));
 	convert_to_dsi_mode(adjusted_mode, &(c_bridge->dsi_mode));
-
-	/* restore bit_clk_rate also for dynamic clk use cases */
-	c_bridge->dsi_mode.timing.clk_rate_hz =
-		dsi_drm_find_bit_clk_rate(c_bridge->display, adjusted_mode);
-
-	pr_debug("clk_rate: %llu\n", c_bridge->dsi_mode.timing.clk_rate_hz);
 }
 
 static bool dsi_bridge_mode_fixup(struct drm_bridge *bridge,
@@ -379,20 +441,17 @@ static bool dsi_bridge_mode_fixup(struct drm_bridge *bridge,
 		cur_dsi_mode.timing.dsc_enabled =
 				dsi_mode.priv_info->dsc_enabled;
 		cur_dsi_mode.timing.dsc = &dsi_mode.priv_info->dsc;
-		rc = dsi_display_validate_mode_change(c_bridge->display,
+		rc = dsi_display_validate_mode_vrr(c_bridge->display,
 					&cur_dsi_mode, &dsi_mode);
-		if (rc) {
-			pr_err("[%s] seamless mode mismatch failure rc=%d\n",
+		if (rc)
+			pr_debug("[%s] vrr mode mismatch failure rc=%d\n",
 				c_bridge->display->name, rc);
-			return false;
-		}
 
 		cur_mode = crtc_state->crtc->mode;
 
 		/* No DMS/VRR when drm pipeline is changing */
 		if (!drm_mode_equal(&cur_mode, adjusted_mode) &&
 			(!(dsi_mode.dsi_mode_flags & DSI_MODE_FLAG_VRR)) &&
-			(!(dsi_mode.dsi_mode_flags & DSI_MODE_FLAG_DYN_CLK)) &&
 			(!crtc_state->active_changed ||
 			 display->is_cont_splash_enabled))
 			dsi_mode.dsi_mode_flags |= DSI_MODE_FLAG_DMS;
@@ -402,33 +461,6 @@ static bool dsi_bridge_mode_fixup(struct drm_bridge *bridge,
 	dsi_convert_to_drm_mode(&dsi_mode, adjusted_mode);
 
 	return true;
-}
-
-u64 dsi_drm_find_bit_clk_rate(void *display,
-			      const struct drm_display_mode *drm_mode)
-{
-	int i = 0, count = 0;
-	struct dsi_display *dsi_display = display;
-	struct dsi_display_mode *dsi_mode;
-	u64 bit_clk_rate = 0;
-
-	if (!dsi_display || !drm_mode)
-		return 0;
-
-	dsi_display_get_mode_count(dsi_display, &count);
-
-	for (i = 0; i < count; i++) {
-		dsi_mode = &dsi_display->modes[i];
-		if ((dsi_mode->timing.v_active == drm_mode->vdisplay) &&
-		    (dsi_mode->timing.h_active == drm_mode->hdisplay) &&
-		    (dsi_mode->pixel_clk_khz == drm_mode->clock) &&
-		    (dsi_mode->timing.refresh_rate == drm_mode->vrefresh)) {
-			bit_clk_rate = dsi_mode->timing.clk_rate_hz;
-			break;
-		}
-	}
-
-	return bit_clk_rate;
 }
 
 int dsi_conn_get_mode_info(struct drm_connector *connector,
@@ -455,7 +487,7 @@ int dsi_conn_get_mode_info(struct drm_connector *connector,
 	mode_info->prefill_lines = dsi_mode.priv_info->panel_prefill_lines;
 	mode_info->jitter_numer = dsi_mode.priv_info->panel_jitter_numer;
 	mode_info->jitter_denom = dsi_mode.priv_info->panel_jitter_denom;
-	mode_info->clk_rate = dsi_drm_find_bit_clk_rate(display, drm_mode);
+	mode_info->clk_rate = dsi_mode.priv_info->clk_rate_hz;
 	mode_info->mdp_transfer_time_us =
 		dsi_mode.priv_info->mdp_transfer_time_us;
 
@@ -560,9 +592,6 @@ int dsi_conn_set_info_blob(struct drm_connector *connector,
 		sde_kms_info_add_keyint(info, "max_fps",
 			panel->dfps_caps.max_refresh_rate);
 	}
-
-	sde_kms_info_add_keystr(info, "dyn bitclk support",
-			panel->dyn_clk_caps.dyn_clk_support ? "true" : "false");
 
 	switch (panel->phy_props.rotation) {
 	case DSI_PANEL_ROTATE_NONE:
@@ -724,9 +753,6 @@ int dsi_connector_get_modes(struct drm_connector *connector,
 		}
 		m->width_mm = connector->display_info.width_mm;
 		m->height_mm = connector->display_info.height_mm;
-		/* set the first mode in list as preferred */
-		if (i == 0)
-			m->type |= DRM_MODE_TYPE_PREFERRED;
 		drm_mode_probed_add(connector, m);
 	}
 end:
@@ -834,9 +860,6 @@ int dsi_conn_post_kickoff(struct drm_connector *connector)
 		c_bridge->dsi_mode.dsi_mode_flags &= ~DSI_MODE_FLAG_VRR;
 	}
 
-	/* ensure dynamic clk switch flag is reset */
-	c_bridge->dsi_mode.dsi_mode_flags &= ~DSI_MODE_FLAG_DYN_CLK;
-
 	return 0;
 }
 
@@ -864,6 +887,18 @@ struct dsi_bridge *dsi_drm_bridge_init(struct dsi_display *display,
 	}
 
 	encoder->bridge = &bridge->base;
+	encoder->bridge->is_dsi_drm_bridge = true;
+	mutex_init(&encoder->bridge->lock);
+
+	if (display->is_prim_display) {
+		gbridge = bridge;
+		atomic_set(&resume_pending, 0);
+		wakeup_source_init(&prim_panel_wakelock, "prim_panel_wakelock");
+		atomic_set(&prim_panel_is_on, false);
+		init_waitqueue_head(&resume_wait_q);
+		INIT_DELAYED_WORK(&prim_panel_work, prim_panel_off_delayed_work);
+	}
+
 	return bridge;
 error_free_bridge:
 	kfree(bridge);
@@ -875,6 +910,12 @@ void dsi_drm_bridge_cleanup(struct dsi_bridge *bridge)
 {
 	if (bridge && bridge->base.encoder)
 		bridge->base.encoder->bridge = NULL;
+
+	if (bridge == gbridge) {
+		atomic_set(&prim_panel_is_on, false);
+		cancel_delayed_work_sync(&prim_panel_work);
+		wakeup_source_trash(&prim_panel_wakelock);
+	}
 
 	kfree(bridge);
 }

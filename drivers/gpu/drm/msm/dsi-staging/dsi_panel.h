@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -48,7 +49,6 @@ enum dsi_backlight_type {
 	DSI_BACKLIGHT_PWM = 0,
 	DSI_BACKLIGHT_WLED,
 	DSI_BACKLIGHT_DCS,
-	DSI_BACKLIGHT_EXTERNAL,
 	DSI_BACKLIGHT_UNKNOWN,
 	DSI_BACKLIGHT_MAX,
 };
@@ -72,18 +72,10 @@ enum dsi_dms_mode {
 };
 
 struct dsi_dfps_capabilities {
+	bool dfps_support;
 	enum dsi_dfps_type type;
 	u32 min_refresh_rate;
 	u32 max_refresh_rate;
-	u32 *dfps_list;
-	u32 dfps_list_len;
-	bool dfps_support;
-};
-
-struct dsi_dyn_clk_caps {
-	bool dyn_clk_support;
-	u32 *bit_clk_list;
-	u32 bit_clk_list_len;
 };
 
 struct dsi_pinctrl_info {
@@ -175,7 +167,6 @@ struct dsi_panel {
 	enum dsi_op_mode panel_mode;
 
 	struct dsi_dfps_capabilities dfps_caps;
-	struct dsi_dyn_clk_caps dyn_clk_caps;
 	struct dsi_panel_phy_props phy_props;
 
 	struct dsi_display_mode *cur_mode;
@@ -278,6 +269,8 @@ int dsi_panel_post_enable(struct dsi_panel *panel);
 int dsi_panel_pre_disable(struct dsi_panel *panel);
 
 int dsi_panel_disable(struct dsi_panel *panel);
+
+int dsi_panel_set_feature(struct dsi_panel *panel,enum dsi_cmd_set_type type);
 
 int dsi_panel_unprepare(struct dsi_panel *panel);
 
