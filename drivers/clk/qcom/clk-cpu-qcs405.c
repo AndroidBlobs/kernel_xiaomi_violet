@@ -153,8 +153,7 @@ static void cpucc_clk_list_registers(struct seq_file *f, struct clk_hw *hw)
 	for (i = 0; i < size; i++) {
 		regmap_read(cpuclk->clkr.regmap,
 				cpuclk->reg_offset + data[i].offset, &val);
-		clock_debug_output(f, false,
-				"%20s: 0x%.8x\n", data[i].name, val);
+		seq_printf(f, "%20s: 0x%.8x\n", data[i].name, val);
 	}
 }
 
