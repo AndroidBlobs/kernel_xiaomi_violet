@@ -3,6 +3,7 @@
  *  linux/kernel/sys.c
  *
  *  Copyright (C) 1991, 1992  Linus Torvalds
+ *  Copyright (C) 2019 XiaoMi, Inc.
  */
 
 #include <linux/export.h>
@@ -1955,10 +1956,11 @@ static int prctl_set_mm_map(int opt, const void __user *addr, unsigned long data
 	}
 
 	/*
-	 * arg_lock protects concurent updates but we still need mmap_sem for
-	 * read to exclude races with sys_brk.
-	 */
+	* arg_lock protects concurent updates but we still need mmap_sem for
+	* read to exclude races with sys_brk.
+	*/
 	down_read(&mm->mmap_sem);
+
 
 	/*
 	 * We don't validate if these members are pointing to
