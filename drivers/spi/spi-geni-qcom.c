@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2017-2018, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -27,7 +28,7 @@
 #include <linux/spi/spi-geni-qcom.h>
 
 #define SPI_NUM_CHIPSELECT	(4)
-#define SPI_XFER_TIMEOUT_MS	(250)
+#define SPI_XFER_TIMEOUT_MS	(1000)
 #define SPI_AUTO_SUSPEND_DELAY	(250)
 /* SPI SE specific registers */
 #define SE_SPI_CPHA		(0x224)
@@ -159,7 +160,6 @@ struct spi_geni_master {
 	void *ipc;
 	bool shared_se;
 	bool dis_autosuspend;
-	bool cmd_done;
 };
 
 static void spi_slv_setup(struct spi_geni_master *mas);
@@ -1369,7 +1369,7 @@ static irqreturn_t geni_spi_irq(int irq, void *data)
 
 		if ((m_irq & M_CMD_DONE_EN) || (m_irq & M_CMD_CANCEL_EN) ||
 			(m_irq & M_CMD_ABORT_EN)) {
-			mas->cmd_done = true;
+			complete(&mas->xfer_done);
 			/*
 			 * If this happens, then a CMD_DONE came before all the
 			 * buffer bytes were sent out. This is unusual, log this
@@ -1409,16 +1409,12 @@ static irqreturn_t geni_spi_irq(int irq, void *data)
 		if (dma_rx_status & RX_DMA_DONE)
 			mas->rx_rem_bytes = 0;
 		if (!mas->tx_rem_bytes && !mas->rx_rem_bytes)
-			mas->cmd_done = true;
+			complete(&mas->xfer_done);
 		if ((m_irq & M_CMD_CANCEL_EN) || (m_irq & M_CMD_ABORT_EN))
-			mas->cmd_done = true;
+			complete(&mas->xfer_done);
 	}
 exit_geni_spi_irq:
 	geni_write_reg(m_irq, mas->base, SE_GENI_M_IRQ_CLEAR);
-	if (mas->cmd_done) {
-		mas->cmd_done = false;
-		complete(&mas->xfer_done);
-	}
 	return IRQ_HANDLED;
 }
 
